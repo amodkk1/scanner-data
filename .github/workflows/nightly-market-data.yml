@@ -1,0 +1,76 @@
+name: Nightly market data
+
+on:
+  schedule:
+    - cron: "30 5 * * 2-6"
+    - cron: "0 14 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      markets:
+        description: "Markets to update (comma-separated)"
+        default: "US,CA,IN"
+      backfill:
+        description: "Re-download the full history"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: market-data
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load previously published data
+        run: |
+          mkdir -p state
+          if git ls-remote --exit-code --heads origin data >/dev/null; then
+            git fetch --depth=1 origin data
+            git --work-tree=state checkout origin/data -- .
+          else
+            echo "No data branch yet - first run will backfill."
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Choose markets
+        id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "markets=${{ inputs.markets }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 14 * * 1-5" ]; then
+            echo "markets=IN" >> "$GITHUB_OUTPUT"
+          else
+            echo "markets=US,CA" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch and build feed
+        env:
+          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+          EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+        run: |
+          python fetch.py --markets "${{ steps.pick.outputs.markets }}" --state state --out out ${{ inputs.backfill && '--backfill' || '' }}
+
+      - name: Publish to the data branch
+        if: always() && hashFiles('out/meta.json') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd out
+          git init -q -b data
+          git config user.name "scanner-data-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -qm "Market data $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" data
