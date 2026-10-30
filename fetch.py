@@ -27,6 +27,12 @@ Environment variables:
   FUND_PER_RUN      tickers per market whose fundamentals are refreshed per run (default 150)
   FEED_MOCK=1       generate synthetic data instead of calling any API (for testing)
 
+My stocks:
+  Tickers listed in my-tickers.json (repo root, written by the app's "My stocks" panel) are always
+  kept in the feed, whatever their liquidity. A newly added ticker gets its full history downloaded
+  on the next run; tickers that can't be found are reported in meta.json ("notFound").
+  Format: {"US": ["AAPL"], "CA": ["SHOP"], "IN": ["TCS"]}
+
 Usage:
   python fetch.py --markets US,CA,IN --state state --out out
 """
@@ -107,6 +113,37 @@ def http_get(url: str, *, session: requests.Session | None = None, params=None, 
 
 
 Bars = dict  # {symbol: {date_iso: [o, h, l, c, v]}}
+
+MY: dict[str, list[str]] = {"US": [], "CA": [], "IN": []}   # user's own tickers, loaded in main()
+SUFFIXES = (".TO", ".TSX", ".V", ".NS", ".NSE", ".BO", ".BSE", ".US")
+
+
+def load_my_tickers() -> dict[str, list[str]]:
+    """Read my-tickers.json from the repo root (or next to this script). Invalid entries are skipped."""
+    import re
+    here = Path(__file__).resolve().parent
+    for p in (Path.cwd() / "my-tickers.json", here / "my-tickers.json", here.parent / "my-tickers.json"):
+        if not p.exists():
+            continue
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+        except (ValueError, OSError) as e:
+            log.warning("my-tickers.json is not valid JSON (%s); ignoring it", e)
+            return {"US": [], "CA": [], "IN": []}
+        out = {}
+        for m in ("US", "CA", "IN"):
+            seen = []
+            for x in raw.get(m, []) if isinstance(raw, dict) else []:
+                sym = str(x).strip().upper()
+                for suf in SUFFIXES:
+                    if sym.endswith(suf):
+                        sym = sym[: -len(suf)]
+                if re.fullmatch(r"[A-Z0-9][A-Z0-9.&\-]{0,19}", sym) and sym not in seen:
+                    seen.append(sym)
+            out[m] = seen[:200]
+        log.info("My stocks: %s", {m: len(v) for m, v in out.items()})
+        return out
+    return {"US": [], "CA": [], "IN": []}
 
 
 def put(bars: Bars, sym: str, day: str, o, h, l, c, v):
@@ -200,9 +237,9 @@ class NSE:
             for row in rd:
                 row = {k.strip(): (v or "").strip() for k, v in row.items() if k}
                 series = row.get("SctySrs") or row.get("SERIES")
-                if series not in ("EQ", "BE"):
-                    continue
                 sym = row.get("TckrSymb") or row.get("SYMBOL")
+                if series not in ("EQ", "BE") and sym not in MY["IN"]:
+                    continue
                 put(bars, sym, d.isoformat(), row.get("OpnPric") or row.get("OPEN"), row.get("HghPric") or row.get("HIGH"),
                     row.get("LwPric") or row.get("LOW"), row.get("ClsPric") or row.get("CLOSE"), row.get("TtlTradgVol") or row.get("TOTTRDQTY"))
                 n += 1
@@ -230,10 +267,15 @@ class Yahoo:
             chunk = syms[i:i + 100]
             ys = [self.ysym(market, s) for s in chunk]
             df = yf.download(ys, start=start.isoformat(), auto_adjust=True, group_by="ticker", threads=True, progress=False)
+            if df is None or df.empty:
+                continue
+            multi = hasattr(df.columns, "levels")
             for s, y in zip(chunk, ys):
                 try:
-                    sub = df[y] if len(ys) > 1 else df
+                    sub = df[y] if multi and y in df.columns.get_level_values(0) else (None if multi else df)
                 except KeyError:
+                    continue
+                if sub is None:
                     continue
                 for idx, row in sub.dropna(how="all").iterrows():
                     put(bars, s, idx.date().isoformat(), row.get("Open"), row.get("High"), row.get("Low"), row.get("Close"), row.get("Volume"))
@@ -304,6 +346,50 @@ class Mock:
                     "e": (dt.date.today() + dt.timedelta(days=self.r.randint(1, 90))).isoformat(), "u": dt.date.today().isoformat()} for s in syms}
 
 
+def fetch_history(market: str, syms: list[str], start: dt.date) -> Bars:
+    """Full daily history for a few individual tickers (used when the user adds a stock)."""
+    bars: Bars = {}
+    if MOCK:
+        mk = Mock(market)
+        real = [s for s in syms if not s.startswith("ZZ")]           # ZZ… = 'unknown ticker' in tests
+        mk.syms = real
+        mk.px = {s: mk.r.uniform(MIN_PRICE[market] * 3, MIN_PRICE[market] * 80) for s in real}
+        mk.vol = {s: mk.r.uniform(.01, .03) for s in real}
+        return mk.fetch(weekdays_between(start, dt.date.today()))[0] if real else {}
+    eod_key, massive_key = os.getenv("EODHD_API_KEY"), os.getenv("MASSIVE_API_KEY")
+    for k, s in enumerate(syms):
+        try:
+            if eod_key:
+                r = http_get(f"https://eodhd.com/api/eod/{s}.{EODHD.EXCH[market]}",
+                             params={"api_token": eod_key, "fmt": "json", "from": start.isoformat()})
+                if r.status_code == 200:
+                    for row in r.json():
+                        adj = (row.get("adjusted_close") or row["close"]) / row["close"] if row.get("close") else 1
+                        put(bars, s, row["date"], row["open"] * adj, row["high"] * adj, row["low"] * adj, row["close"] * adj, row.get("volume"))
+            elif market == "US" and massive_key:
+                if k:
+                    time.sleep(12.5)  # free plan: 5 requests/minute
+                from zoneinfo import ZoneInfo
+                r = http_get(f"https://api.massive.com/v2/aggs/ticker/{s}/range/1/day/{start.isoformat()}/{dt.date.today().isoformat()}",
+                             params={"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": massive_key})
+                if r.status_code == 200:
+                    for row in r.json().get("results") or []:
+                        d = dt.datetime.fromtimestamp(row["t"] / 1000, ZoneInfo("America/New_York")).date().isoformat()
+                        put(bars, s, d, row.get("o"), row.get("h"), row.get("l"), row.get("c"), row.get("v"))
+        except Exception as e:  # noqa: BLE001
+            log.warning("history for %s failed: %s", s, e)
+    left = [s for s in syms if s not in bars]
+    if left:
+        try:
+            b, _ = Yahoo().fetch(market, left, start)
+            bars.update(b)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Yahoo history for %s failed: %s", ", ".join(left), e)
+    for s in syms:
+        log.info("[%s] my stock %s: %s", market, s, f"{len(bars[s])} sessions downloaded" if s in bars else "NOT FOUND")
+    return bars
+
+
 # --------------------------------------------------------------------------- state & output
 def load_state(path: Path) -> dict:
     """Read a previously published feed file back into {sym: {date: [o,h,l,c,v]}} plus metadata."""
@@ -336,8 +422,8 @@ def select_universe(market: str, bars: Bars, dates: list[str]) -> list[str]:
             continue
         ranked.append((sorted(vals)[len(vals) // 2], s))
     ranked.sort(reverse=True)
-    keep = [s for _, s in ranked[:UNIVERSE[market]]]
-    for s in INDEX_SYMS[market]:
+    keep = [s for _, s in ranked if s not in MY[market]][:UNIVERSE[market]]
+    for s in INDEX_SYMS[market] + MY[market]:
         if s in bars and s not in keep:
             keep.append(s)
     return keep
@@ -381,6 +467,8 @@ def build_output(market: str, bars: Bars, meta: dict, sources: list[str], warnin
 def run_market(market: str, state_dir: Path, out_dir: Path, backfill: bool) -> dict:
     st = load_state(state_dir / f"{market}.json")
     bars, meta = st["bars"], st["meta"]
+    prior = set(bars)
+    mine = MY[market]
     today = dt.date.today()
     last = max((d for by in bars.values() for d in by), default=None)
     start = today - dt.timedelta(days=int(HISTORY * 1.45) + 10) if (backfill or not last) else dt.date.fromisoformat(last) + dt.timedelta(days=1)
@@ -414,10 +502,10 @@ def run_market(market: str, state_dir: Path, out_dir: Path, backfill: bool) -> d
                 except Exception as e:  # noqa: BLE001
                     warnings.append(f"NSE archive failed ({e}); used Yahoo Finance instead")
                     log.warning(warnings[-1])
-                    syms = sorted(bars) or nifty500()
+                    syms = sorted(set(bars) | set(mine)) or nifty500()
                     b, src = Yahoo().fetch("IN", syms, start)
             else:  # CA
-                syms = sorted(set(bars) | set(tsx_universe()))
+                syms = sorted(set(bars) | set(tsx_universe()) | set(mine))
                 b, src = Yahoo().fetch("CA", syms, start)
             merge(b); sources += src
         except Exception as e:  # noqa: BLE001
@@ -425,6 +513,16 @@ def run_market(market: str, state_dir: Path, out_dir: Path, backfill: bool) -> d
             log.error("[%s] %s", market, e)
     for s, by in new.items():
         bars.setdefault(s, {}).update(by)
+    # My stocks: download full history for any newly added ticker
+    need = [s for s in mine if s not in prior and len(bars.get(s, {})) < 60]
+    if need:
+        log.info("[%s] downloading history for newly added stock(s): %s", market, ", ".join(need))
+        hist_start = today - dt.timedelta(days=int(HISTORY * 1.45) + 10)
+        for s, by in fetch_history(market, need, hist_start).items():
+            bars.setdefault(s, {}).update(by)
+    not_found = [s for s in mine if s not in bars]
+    if not_found:
+        warnings.append(f"My stocks not found: {', '.join(not_found)} — check the symbol")
     if not bars:
         raise RuntimeError(f"[{market}] no data at all — check API keys / network")
 
@@ -444,7 +542,8 @@ def run_market(market: str, state_dir: Path, out_dir: Path, backfill: bool) -> d
     out = build_output(market, bars, meta, sources, warnings)
     (out_dir / f"{market}.json").write_text(json.dumps(out, separators=(",", ":")))
     log.info("[%s] wrote %d tickers × %d sessions, as of %s", market, len(out["tickers"]), len(out["dates"]), out["asOf"])
-    return {"asOf": out["asOf"], "tickers": len(out["tickers"]), "sessions": len(out["dates"]), "source": out["source"], "warnings": warnings}
+    return {"asOf": out["asOf"], "generated": out["generated"], "tickers": len(out["tickers"]), "sessions": len(out["dates"]),
+            "source": out["source"], "warnings": warnings, "mine": [s for s in mine if s in bars], "notFound": not_found}
 
 
 def tsx_universe() -> list[str]:
@@ -478,6 +577,7 @@ def main():
     ap.add_argument("--out", default="out")
     ap.add_argument("--backfill", action="store_true", help="re-download the full history")
     a = ap.parse_args()
+    MY.update(load_my_tickers())
     state, out = Path(a.state), Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     meta_path = state / "meta.json"
