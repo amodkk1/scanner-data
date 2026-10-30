@@ -57,7 +57,7 @@ log = logging.getLogger("fetch")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 
 HISTORY = int(os.getenv("HISTORY", "420"))
-UNIVERSE = {"US": int(os.getenv("UNIVERSE_US", "1000")), "CA": int(os.getenv("UNIVERSE_CA", "300")), "IN": int(os.getenv("UNIVERSE_IN", "1000"))}
+UNIVERSE = {"US": int(os.getenv("UNIVERSE_US", "1000")), "CA": int(os.getenv("UNIVERSE_CA", "1500")), "IN": int(os.getenv("UNIVERSE_IN", "1000"))}
 MIN_PRICE = {"US": 3.0, "CA": 1.0, "IN": 20.0}
 INDEX_SYMS = {"US": ["SPY"], "CA": ["XIU", "XIC"], "IN": ["NIFTYBEES"]}   # always kept for the regime filter
 FUND_PER_RUN = int(os.getenv("FUND_PER_RUN", "150"))
@@ -394,7 +394,7 @@ def fetch_history(market: str, syms: list[str], start: dt.date) -> Bars:
 def load_state(path: Path) -> dict:
     """Read a previously published feed file back into {sym: {date: [o,h,l,c,v]}} plus metadata."""
     if not path.exists():
-        return {"bars": {}, "meta": {}}
+        return {"bars": {}, "meta": {}, "noData": {}}
     j = json.loads(path.read_text())
     dates = j["dates"]
     bars: Bars = {}
@@ -407,7 +407,7 @@ def load_state(path: Path) -> dict:
                 continue
             bars.setdefault(t["s"], {})[dates[st + k]] = [t["o"][k], t["h"][k], t["l"][k], c, t["v"][k] or 0]
         meta[t["s"]] = {k: t[k] for k in ("n", "x", "cap", "f", "e", "u") if k in t}
-    return {"bars": bars, "meta": meta, "fund_cache": j.get("fund_cache", {})}
+    return {"bars": bars, "meta": meta, "noData": j.get("noData", {})}
 
 
 def select_universe(market: str, bars: Bars, dates: list[str]) -> list[str]:
@@ -468,6 +468,7 @@ def run_market(market: str, state_dir: Path, out_dir: Path, backfill: bool) -> d
     st = load_state(state_dir / f"{market}.json")
     bars, meta = st["bars"], st["meta"]
     prior = set(bars)
+    no_data: dict[str, str] = st.get("noData", {})
     mine = MY[market]
     today = dt.date.today()
     last = max((d for by in bars.values() for d in by), default=None)
@@ -505,8 +506,24 @@ def run_market(market: str, state_dir: Path, out_dir: Path, backfill: bool) -> d
                     syms = sorted(set(bars) | set(mine)) or nifty500()
                     b, src = Yahoo().fetch("IN", syms, start)
             else:  # CA
-                syms = sorted(set(bars) | set(tsx_universe()) | set(mine))
-                b, src = Yahoo().fetch("CA", syms, start)
+                universe, usrc = tsx_universe()
+                log.info("[CA] stock list: %s", usrc)
+                if "unavailable" in usrc:
+                    warnings.append(f"Canada stock list: {usrc}")
+                known = sorted(set(bars) | set(mine))
+                b, src = Yahoo().fetch("CA", known, start) if known else ({}, [])
+                hist_start = today - dt.timedelta(days=int(HISTORY * 1.45) + 10)
+                retry_after = (today - dt.timedelta(days=30)).isoformat()
+                fresh = [x for x in universe if x not in bars and x not in mine and no_data.get(x, "") < retry_after]
+                if fresh:
+                    log.info("[CA] downloading history for %d stock(s) new to the list", len(fresh))
+                    b2, _ = Yahoo().fetch("CA", fresh, hist_start)
+                    for x, by in b2.items():
+                        b.setdefault(x, {}).update(by)
+                    for x in fresh:
+                        if x not in b2:
+                            no_data[x] = today.isoformat()   # no prices on Yahoo; try again in 30 days
+                src = [f"Yahoo Finance (yfinance) · {usrc}"]
             merge(b); sources += src
         except Exception as e:  # noqa: BLE001
             warnings.append(f"Price update failed: {e}")
@@ -540,25 +557,67 @@ def run_market(market: str, state_dir: Path, out_dir: Path, backfill: bool) -> d
     if not sources:
         sources = ["no new sessions"]
     out = build_output(market, bars, meta, sources, warnings)
+    if no_data:
+        out["noData"] = no_data
     (out_dir / f"{market}.json").write_text(json.dumps(out, separators=(",", ":")))
     log.info("[%s] wrote %d tickers × %d sessions, as of %s", market, len(out["tickers"]), len(out["dates"]), out["asOf"])
     return {"asOf": out["asOf"], "generated": out["generated"], "tickers": len(out["tickers"]), "sessions": len(out["dates"]),
             "source": out["source"], "warnings": warnings, "mine": [s for s in mine if s in bars], "notFound": not_found}
 
 
-def tsx_universe() -> list[str]:
-    """S&P/TSX Composite constituents from Wikipedia; falls back to a seed list."""
-    try:
+def clean_tsx(sym) -> str | None:
+    """TSX symbol -> our form (class shares and trust units kept, e.g. BAM.A -> BAM-A, REI.UN -> REI-UN).
+    Preferred shares, debentures, warrants, notes, rights and US-dollar lines are dropped."""
+    import re
+    sym = str(sym or "").strip().upper().replace(".TO", "")
+    if not sym or not re.fullmatch(r"[A-Z0-9]{1,6}([.\-][A-Z]{1,2})?", sym):
+        return None
+    parts = re.split(r"[.\-]", sym)
+    if len(parts) == 2 and not (parts[1] == "UN" or (len(parts[1]) == 1 and parts[1] not in ("U", "R"))):
+        return None
+    return "-".join(parts)
+
+
+def tsx_universe() -> tuple[list[str], str]:
+    """Every TSX-listed stock. Tries, in order: TMX's official listed-company directory, EODHD's symbol
+    list (if EODHD_API_KEY is set), the S&P/TSX Composite list on Wikipedia, then a built-in seed list."""
+    found: set[str] = set()
+    try:  # 1) TMX directory (all TSX issuers and their share classes)
+        r = http_get("https://www.tsx.com/json/company-directory/search/tsx/%5E*",
+                     headers={"User-Agent": UA, "Accept": "application/json", "Referer": "https://www.tsx.com/"}, retries=2)
+        for co in (r.json().get("results") or []):
+            for ins in (co.get("instruments") or [co]):
+                c = clean_tsx(ins.get("symbol"))
+                if c:
+                    found.add(c)
+    except Exception as e:  # noqa: BLE001
+        log.warning("TMX company directory failed (%s)", e)
+    if len(found) > 400:
+        return sorted(found | {"XIU"}), f"TMX directory, {len(found)} TSX symbols"
+    key = os.getenv("EODHD_API_KEY")
+    if key:  # 2) EODHD symbol list (1 API call; works on its free plan too)
+        try:
+            r = http_get("https://eodhd.com/api/exchange-symbol-list/TO", params={"api_token": key, "fmt": "json"})
+            for row in r.json():
+                if row.get("Type") in ("Common Stock", "ETF", "FUND"):
+                    c = clean_tsx(row.get("Code"))
+                    if c:
+                        found.add(c)
+        except Exception as e:  # noqa: BLE001
+            log.warning("EODHD symbol list failed (%s)", e)
+        if len(found) > 400:
+            return sorted(found | {"XIU"}), f"EODHD symbol list, {len(found)} TSX symbols"
+    try:  # 3) S&P/TSX Composite (~220 largest companies)
         import pandas as pd
         html = http_get("https://en.wikipedia.org/wiki/S%26P/TSX_Composite_Index", headers={"User-Agent": UA}).text
         for t in pd.read_html(io.StringIO(html)):
             col = next((c for c in t.columns if str(c).lower() in ("symbol", "ticker")), None)
             if col is not None and len(t) > 150:
-                syms = [str(x).replace(".TO", "").replace(".", "-").strip() for x in t[col]]
-                return sorted(set(syms) | {"XIU"})
+                found |= {c for c in (clean_tsx(x) for x in t[col]) if c}
+                return sorted(found | {"XIU"}), f"S&P/TSX Composite only ({len(found)} symbols) — full TSX list unavailable today"
     except Exception as e:  # noqa: BLE001
-        log.warning("TSX constituent list failed (%s); using seed list", e)
-    return CA_SEED
+        log.warning("TSX Composite list failed (%s)", e)
+    return sorted(set(CA_SEED) | found), "built-in list of large Canadian stocks — full TSX list unavailable today"
 
 
 def nifty500() -> list[str]:
