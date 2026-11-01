@@ -190,13 +190,24 @@ class Massive:
 
     def fetch(self, days: list[dt.date]) -> tuple[Bars, list[str]]:
         bars: Bars = {}
+        refused, last_msg = 0, ""
         for k, d in enumerate(days):
             if k:
                 time.sleep(12.5)  # stay under 5 requests/minute
             r = http_get(f"https://api.massive.com/v2/aggs/grouped/locale/us/market/stocks/{d.isoformat()}",
                          params={"adjusted": "true", "apiKey": self.key})
+            if r.status_code == 401:
+                raise RuntimeError("Massive rejected the API key (401). Check the MASSIVE_API_KEY secret has the exact key from your Massive dashboard.")
             if r.status_code == 403:
-                log.warning("Massive: %s not available yet on this plan (403)", d)
+                refused += 1
+                try:
+                    last_msg = r.json().get("message", "")
+                except ValueError:
+                    last_msg = ""
+                log.warning("Massive: %s refused (403) %s", d, last_msg)
+                if refused >= 3 and not bars:
+                    raise RuntimeError("Massive refused the stock data (403) — the key isn't on a Stocks plan. "
+                                       "On massive.com subscribe to 'Stocks Basic' (free). " + (f"Massive said: {last_msg}" if last_msg else ""))
                 continue
             r.raise_for_status()
             for row in r.json().get("results") or []:
@@ -494,9 +505,25 @@ def run_market(market: str, state_dir: Path, out_dir: Path, backfill: bool) -> d
             elif eod_key:
                 b, src = EODHD(eod_key).fetch(market, days, None)
             elif market == "US":
-                if not massive_key:
-                    raise RuntimeError("Set MASSIVE_API_KEY (free at massive.com) or EODHD_API_KEY for US data")
-                b, src = Massive(massive_key).fetch(days)
+                b, src, massive_ok = {}, [], False
+                if massive_key:
+                    try:
+                        b, src = Massive(massive_key).fetch(days)
+                        massive_ok = bool(b) or bool(bars)   # nothing new is fine once we have history
+                    except Exception as e:  # noqa: BLE001
+                        warnings.append(f"Massive: {e} Used Yahoo Finance instead.")
+                        log.warning("[US] %s", warnings[-1])
+                        b = {}
+                else:
+                    warnings.append("No MASSIVE_API_KEY secret found, so US prices came from Yahoo Finance.")
+                    log.warning("[US] %s", warnings[-1])
+                if not massive_ok:
+                    universe, usrc = us_universe()
+                    log.info("[US] stock list: %s", usrc)
+                    if "unavailable" in usrc:
+                        warnings.append(f"US stock list: {usrc}")
+                    b = yahoo_update("US", universe, bars, mine, start, today, no_data)
+                    src = [f"Yahoo Finance (yfinance) · {usrc}"]
             elif market == "IN":
                 try:
                     b, src = NSE().fetch(days)
@@ -510,19 +537,7 @@ def run_market(market: str, state_dir: Path, out_dir: Path, backfill: bool) -> d
                 log.info("[CA] stock list: %s", usrc)
                 if "unavailable" in usrc:
                     warnings.append(f"Canada stock list: {usrc}")
-                known = sorted(set(bars) | set(mine))
-                b, src = Yahoo().fetch("CA", known, start) if known else ({}, [])
-                hist_start = today - dt.timedelta(days=int(HISTORY * 1.45) + 10)
-                retry_after = (today - dt.timedelta(days=30)).isoformat()
-                fresh = [x for x in universe if x not in bars and x not in mine and no_data.get(x, "") < retry_after]
-                if fresh:
-                    log.info("[CA] downloading history for %d stock(s) new to the list", len(fresh))
-                    b2, _ = Yahoo().fetch("CA", fresh, hist_start)
-                    for x, by in b2.items():
-                        b.setdefault(x, {}).update(by)
-                    for x in fresh:
-                        if x not in b2:
-                            no_data[x] = today.isoformat()   # no prices on Yahoo; try again in 30 days
+                b = yahoo_update("CA", universe, bars, mine, start, today, no_data)
                 src = [f"Yahoo Finance (yfinance) · {usrc}"]
             merge(b); sources += src
         except Exception as e:  # noqa: BLE001
@@ -541,7 +556,7 @@ def run_market(market: str, state_dir: Path, out_dir: Path, backfill: bool) -> d
     if not_found:
         warnings.append(f"My stocks not found: {', '.join(not_found)} — check the symbol")
     if not bars:
-        raise RuntimeError(f"[{market}] no data at all — check API keys / network")
+        raise RuntimeError(f"No {market} prices could be downloaded. " + " ".join(warnings[-3:]))
 
     # Fundamentals: refresh the stalest FUND_PER_RUN tickers in the (new) universe
     all_dates = sorted({d for by in bars.values() for d in by})[-HISTORY:]
@@ -563,6 +578,50 @@ def run_market(market: str, state_dir: Path, out_dir: Path, backfill: bool) -> d
     log.info("[%s] wrote %d tickers × %d sessions, as of %s", market, len(out["tickers"]), len(out["dates"]), out["asOf"])
     return {"asOf": out["asOf"], "generated": out["generated"], "tickers": len(out["tickers"]), "sessions": len(out["dates"]),
             "source": out["source"], "warnings": warnings, "mine": [s for s in mine if s in bars], "notFound": not_found}
+
+
+def yahoo_update(market: str, universe: list[str], bars: Bars, mine: list[str], start: dt.date, today: dt.date,
+                 no_data: dict) -> Bars:
+    """Yahoo prices for a stock list: new sessions for stocks we already have, full history for new ones."""
+    known = sorted(set(bars) | set(mine))
+    b, _ = Yahoo().fetch(market, known, start) if known else ({}, [])
+    hist_start = today - dt.timedelta(days=int(HISTORY * 1.45) + 10)
+    retry_after = (today - dt.timedelta(days=30)).isoformat()
+    fresh = [x for x in universe if x not in bars and x not in mine and no_data.get(x, "") < retry_after]
+    if fresh:
+        log.info("[%s] downloading history for %d stock(s) new to the list", market, len(fresh))
+        b2, _ = Yahoo().fetch(market, fresh, hist_start)
+        for x, by in b2.items():
+            b.setdefault(x, {}).update(by)
+        for x in fresh:
+            if x not in b2:
+                no_data[x] = today.isoformat()   # no prices on Yahoo; try again in 30 days
+    return b
+
+
+US_SEED = ("AAPL MSFT NVDA AMZN GOOGL META AVGO TSLA BRK.B JPM LLY V UNH XOM MA COST HD PG JNJ WMT NFLX ABBV BAC CRM ORCL KO CVX MRK "
+           "AMD PEP ADBE TMO LIN ACN MCD CSCO WFC ABT IBM GE DHR PM INTU QCOM TXN CAT AMGN VZ NOW ISRG GS SPGI PFE UBER AMAT "
+           "BKNG NEE RTX T LOW HON UNP BLK ELV SYK PLD MS PGR SCHW TJX C BSX VRTX LMT ADP MDT REGN CB MMC DE PANW ADI SBUX "
+           "MU KLAC LRCX ANET GILD BMY SO CI FI ICE DUK SHW MO ZTS CME SPY").split()
+
+
+def us_universe() -> tuple[list[str], str]:
+    """S&P 500 + S&P MidCap 400 + S&P SmallCap 600 (about 1,500 US stocks) from Wikipedia; seed list if unavailable."""
+    import pandas as pd
+    found: set[str] = set()
+    for page in ("List_of_S%26P_500_companies", "List_of_S%26P_400_companies", "List_of_S%26P_600_companies"):
+        try:
+            html = http_get(f"https://en.wikipedia.org/wiki/{page}", headers={"User-Agent": UA}).text
+            for t in pd.read_html(io.StringIO(html)):
+                col = next((c for c in t.columns if str(c).lower() in ("symbol", "ticker", "ticker symbol")), None)
+                if col is not None and len(t) > 300:
+                    found |= {str(x).strip().upper() for x in t[col] if str(x).strip()}
+                    break
+        except Exception as e:  # noqa: BLE001
+            log.warning("US stock list %s failed (%s)", page, e)
+    if len(found) > 400:
+        return sorted(found | {"SPY"}), f"S&P 500/400/600, {len(found)} stocks"
+    return sorted(set(US_SEED) | found), "built-in list of large US stocks — S&P lists unavailable today"
 
 
 def clean_tsx(sym) -> str | None:
@@ -645,9 +704,11 @@ def main():
     for m in [x.strip().upper() for x in a.markets.split(",") if x.strip()]:
         try:
             meta["markets"][m] = run_market(m, state, out, a.backfill)
+            meta.setdefault("errors", {}).pop(m, None)
         except Exception as e:  # noqa: BLE001
             log.error("%s", e)
             failed.append(m)
+            meta.setdefault("errors", {})[m] = {"at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "message": str(e)}
             if (state / f"{m}.json").exists():  # keep publishing yesterday's file
                 (out / f"{m}.json").write_bytes((state / f"{m}.json").read_bytes())
     # carry over files for markets not processed this run
