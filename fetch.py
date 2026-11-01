@@ -22,7 +22,7 @@ Data sources (first one that is configured / works wins):
 Environment variables:
   MASSIVE_API_KEY   free key from massive.com (US daily bars)
   EODHD_API_KEY     optional paid key (one bulk call per exchange per day)
-  HISTORY           sessions to keep (default 420 ≈ 20 months)
+  HISTORY           sessions to keep (default 760 ≈ 3 years)
   UNIVERSE_US/CA/IN max tickers kept per market, ranked by traded value
   FUND_PER_RUN      tickers per market whose fundamentals are refreshed per run (default 150)
   FEED_MOCK=1       generate synthetic data instead of calling any API (for testing)
@@ -56,7 +56,7 @@ import requests
 log = logging.getLogger("fetch")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 
-HISTORY = int(os.getenv("HISTORY", "420"))
+HISTORY = int(os.getenv("HISTORY", "760"))
 UNIVERSE = {"US": int(os.getenv("UNIVERSE_US", "1000")), "CA": int(os.getenv("UNIVERSE_CA", "1500")), "IN": int(os.getenv("UNIVERSE_IN", "1000"))}
 MIN_PRICE = {"US": 3.0, "CA": 1.0, "IN": 20.0}
 INDEX_SYMS = {"US": ["SPY"], "CA": ["XIU", "XIC"], "IN": ["NIFTYBEES"]}   # always kept for the regime filter
@@ -545,6 +545,16 @@ def run_market(market: str, state_dir: Path, out_dir: Path, backfill: bool) -> d
             log.error("[%s] %s", market, e)
     for s, by in new.items():
         bars.setdefault(s, {}).update(by)
+    # India: NSE's archive only keeps about a year of daily files (older days answer 404, which looks like a
+    # holiday). Fill the older part of the history from Yahoo Finance, scaled to join NSE's prices seamlessly.
+    if market == "IN" and bars and not MOCK:
+        try:
+            added = india_extend(bars, mine, today - dt.timedelta(days=int(HISTORY * 1.45) + 10))
+            if added:
+                sources.append(f"Yahoo Finance for sessions before {added}")
+        except Exception as e:  # noqa: BLE001
+            warnings.append(f"Couldn’t extend India history before NSE’s archive: {e}")
+            log.warning("[IN] %s", warnings[-1])
     # My stocks: download full history for any newly added ticker
     need = [s for s in mine if s not in prior and len(bars.get(s, {})) < 60]
     if need:
@@ -677,6 +687,54 @@ def tsx_universe() -> tuple[list[str], str]:
     except Exception as e:  # noqa: BLE001
         log.warning("TSX Composite list failed (%s)", e)
     return sorted(set(CA_SEED) | found), "built-in list of large Canadian stocks — full TSX list unavailable today"
+
+
+def india_extend(bars: Bars, mine: list[str], want_start: dt.date) -> str | None:
+    """Add Yahoo Finance sessions older than the first NSE session. Each stock's Yahoo prices are multiplied by
+    NSE close / Yahoo close on the first shared day, so the two sources join without a jump."""
+    first = min(d for by in bars.values() for d in by)
+    if dt.date.fromisoformat(first) <= want_start + dt.timedelta(days=21):
+        return None
+    dates = sorted({d for by in bars.values() for d in by})
+    syms = select_universe("IN", bars, dates[-HISTORY:])
+    syms = [s for s in dict.fromkeys(syms + INDEX_SYMS["IN"] + list(mine)) if s in bars]
+    log.info("[IN] NSE history starts %s; filling %s → %s from Yahoo for %d stocks", first, want_start, first, len(syms))
+    import yfinance as yf
+    end = (dt.date.fromisoformat(first) + dt.timedelta(days=10)).isoformat()
+    filled = 0
+    for i in range(0, len(syms), 100):
+        chunk = syms[i:i + 100]
+        ys = [Yahoo.ysym("IN", x) for x in chunk]
+        df = yf.download(ys, start=want_start.isoformat(), end=end, auto_adjust=False, group_by="ticker", threads=True, progress=False)
+        if df is None or df.empty:
+            continue
+        multi = hasattr(df.columns, "levels")
+        for s, y in zip(chunk, ys):
+            try:
+                sub = df[y] if multi and y in df.columns.get_level_values(0) else (None if multi else df)
+            except KeyError:
+                continue
+            if sub is None:
+                continue
+            rows = {idx.date().isoformat(): row for idx, row in sub.dropna(how="all").iterrows()}
+            by = bars[s]
+            shared = sorted(d for d in rows if d in by and d >= first)
+            if not shared:
+                continue
+            yc = rows[shared[0]].get("Close")
+            if not yc or yc != yc or yc <= 0:
+                continue
+            k = by[shared[0]][3] / float(yc)
+            for d, row in rows.items():
+                if d < first and d not in by:
+                    o, h, l, c, v = (row.get(x) for x in ("Open", "High", "Low", "Close", "Volume"))
+                    if c is None or c != c:
+                        continue
+                    put(bars, s, d, (o or c) * k, (h or c) * k, (l or c) * k, c * k, (v or 0) / k if k else v)
+                    filled += 1
+        time.sleep(2)
+    log.info("[IN] added %d older daily bars from Yahoo", filled)
+    return first if filled else None
 
 
 def nifty500() -> list[str]:
