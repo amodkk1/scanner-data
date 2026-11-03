@@ -442,14 +442,16 @@ def select_universe(market: str, bars: Bars, dates: list[str]) -> list[str]:
 
 def build_output(market: str, bars: Bars, meta: dict, sources: list[str], warnings: list[str]) -> dict:
     all_dates = sorted({d for by in bars.values() for d in by})
-    # a session counts only if a meaningful share of symbols traded (drops stray holiday rows)
+    # Pick the stocks first, then keep a session only if a meaningful share of THOSE stocks traded that day (drops stray
+    # holiday rows). Counting all symbols instead wrongly dropped older days in India, where each new NSE file brings
+    # ~2,500 symbols while the stored history holds only the chosen ~1,000.
+    syms = select_universe(market, bars, all_dates[-HISTORY:])
     counts = {d: 0 for d in all_dates}
-    for by in bars.values():
-        for d in by:
+    for s in syms:
+        for d in bars[s]:
             counts[d] += 1
     peak = max(counts.values()) if counts else 0
     dates = [d for d in all_dates if counts[d] >= peak * .3][-HISTORY:]
-    syms = select_universe(market, bars, dates)
     idx = {d: i for i, d in enumerate(dates)}
     tickers = []
     for s in syms:
@@ -690,20 +692,30 @@ def tsx_universe() -> tuple[list[str], str]:
 
 
 def india_extend(bars: Bars, mine: list[str], want_start: dt.date) -> str | None:
-    """Add Yahoo Finance sessions older than the first NSE session. Each stock's Yahoo prices are multiplied by
-    NSE close / Yahoo close on the first shared day, so the two sources join without a jump."""
-    first = min(d for by in bars.values() for d in by)
-    if dt.date.fromisoformat(first) <= want_start + dt.timedelta(days=21):
-        return None
+    """NSE's archive keeps only about a year of daily files, so fill each stock's older history from Yahoo Finance.
+    Works per stock: a stock whose own history starts late gets Yahoo bars for the missing earlier days, multiplied by
+    NSE close / Yahoo close on the first day both have, so the two sources join without a jump."""
     dates = sorted({d for by in bars.values() for d in by})
     syms = select_universe("IN", bars, dates[-HISTORY:])
     syms = [s for s in dict.fromkeys(syms + INDEX_SYMS["IN"] + list(mine)) if s in bars]
-    log.info("[IN] NSE history starts %s; filling %s → %s from Yahoo for %d stocks", first, want_start, first, len(syms))
+    def run_start(by):   # first day of the unbroken recent run of data (a stray old bar must not hide a long gap)
+        ds = sorted(by)
+        for k in range(len(ds) - 1, 0, -1):
+            if (dt.date.fromisoformat(ds[k]) - dt.date.fromisoformat(ds[k - 1])).days > 30:
+                return ds[k]
+        return ds[0]
+    limit = (want_start + dt.timedelta(days=21)).isoformat()
+    firsts = {s: run_start(bars[s]) for s in syms}
+    need = [s for s in syms if firsts[s] > limit]
+    if not need:
+        return None
+    firsts = {s: firsts[s] for s in need}
+    log.info("[IN] %d stocks have history starting after %s; filling from %s with Yahoo", len(need), limit, want_start)
     import yfinance as yf
-    end = (dt.date.fromisoformat(first) + dt.timedelta(days=10)).isoformat()
-    filled = 0
-    for i in range(0, len(syms), 100):
-        chunk = syms[i:i + 100]
+    end = (dt.date.fromisoformat(max(firsts.values())) + dt.timedelta(days=10)).isoformat()
+    filled, earliest = 0, None
+    for i in range(0, len(need), 100):
+        chunk = need[i:i + 100]
         ys = [Yahoo.ysym("IN", x) for x in chunk]
         df = yf.download(ys, start=want_start.isoformat(), end=end, auto_adjust=False, group_by="ticker", threads=True, progress=False)
         if df is None or df.empty:
@@ -717,7 +729,7 @@ def india_extend(bars: Bars, mine: list[str], want_start: dt.date) -> str | None
             if sub is None:
                 continue
             rows = {idx.date().isoformat(): row for idx, row in sub.dropna(how="all").iterrows()}
-            by = bars[s]
+            by, first = bars[s], firsts[s]
             shared = sorted(d for d in rows if d in by and d >= first)
             if not shared:
                 continue
@@ -732,9 +744,10 @@ def india_extend(bars: Bars, mine: list[str], want_start: dt.date) -> str | None
                         continue
                     put(bars, s, d, (o or c) * k, (h or c) * k, (l or c) * k, c * k, (v or 0) / k if k else v)
                     filled += 1
+                    earliest = d if earliest is None or d < earliest else earliest
         time.sleep(2)
-    log.info("[IN] added %d older daily bars from Yahoo", filled)
-    return first if filled else None
+    log.info("[IN] added %d older daily bars from Yahoo for %d stocks", filled, len(need))
+    return max(firsts.values()) if filled else None
 
 
 def nifty500() -> list[str]:
@@ -744,6 +757,56 @@ def nifty500() -> list[str]:
         return [row["Symbol"] for row in csv.DictReader(io.StringIO(r.text))] + ["NIFTYBEES"]
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(f"no Indian universe available ({e})") from e
+
+
+# --------------------------------------------------------------------------- market indices (Markets page)
+INDICES = {
+    "US": [("^GSPC", "S&P 500"), ("^IXIC", "Nasdaq Composite"), ("^DJI", "Dow Jones Industrial Average")],
+    "CA": [("^GSPTSE", "S&P/TSX Composite"), ("^TX60", "S&P/TSX 60")],
+    "IN": [("^NSEI", "Nifty 50"), ("^BSESN", "BSE Sensex"), ("^NSEBANK", "Nifty Bank")],
+}
+
+
+def update_indices(markets: list[str], state: Path, out: Path) -> None:
+    """indices.json: daily OHLC of each market's main indices (real index points, from Yahoo Finance). Only the markets in
+    this run are refreshed; the others are kept from the last published file."""
+    old = {}
+    if (state / "indices.json").exists():
+        try:
+            old = json.loads((state / "indices.json").read_text()).get("indices", {})
+        except Exception:  # noqa: BLE001
+            old = {}
+    idx = dict(old)
+    start = dt.date.today() - dt.timedelta(days=int(HISTORY * 1.45) + 10)
+    for m in markets:
+        for sym, name in INDICES.get(m, []):
+            try:
+                if MOCK:
+                    r = random.Random(sym); px = {"US": 5000, "CA": 25000, "IN": 24000}[m]; rows = []
+                    for d in weekdays_between(start, dt.date.today()):
+                        px *= math.exp(r.gauss(.0004, .01)); hi, lo = px * (1 + abs(r.gauss(0, .005))), px * (1 - abs(r.gauss(0, .005)))
+                        rows.append((d.isoformat(), px * (1 + r.gauss(0, .003)), hi, lo, px, 1e9))
+                else:
+                    import yfinance as yf
+                    df = yf.download(sym, start=start.isoformat(), auto_adjust=False, progress=False)
+                    if df is None or df.empty:
+                        raise RuntimeError("no data returned")
+                    if hasattr(df.columns, "levels"):   # newer yfinance returns (field, ticker) columns
+                        df.columns = df.columns.get_level_values(0)
+                    rows = [(i.date().isoformat(), r_.get("Open"), r_.get("High"), r_.get("Low"), r_.get("Close"), r_.get("Volume") or 0)
+                            for i, r_ in df.dropna(subset=["Close"]).iterrows()]
+                rows = [x for x in rows if all(v is not None and v == v for v in x[1:5])][-HISTORY:]
+                if len(rows) < 30:
+                    raise RuntimeError(f"only {len(rows)} sessions")
+                idx[sym] = {"s": sym, "n": name, "m": m, "asOf": rows[-1][0], "dates": [x[0] for x in rows],
+                            "o": [rnd(x[1]) for x in rows], "h": [rnd(x[2]) for x in rows], "l": [rnd(x[3]) for x in rows],
+                            "c": [rnd(x[4]) for x in rows], "v": [int(x[5] or 0) for x in rows]}
+                log.info("[%s] index %s: %d sessions to %s", m, sym, len(rows), rows[-1][0])
+            except Exception as e:  # noqa: BLE001 — an index failing must never stop the stock data
+                log.warning("[%s] index %s skipped: %s", m, sym, e)
+            if not MOCK:
+                time.sleep(1)
+    (out / "indices.json").write_text(json.dumps({"v": 1, "generated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "indices": idx}, separators=(",", ":")))
 
 
 def main():
@@ -769,6 +832,10 @@ def main():
             meta.setdefault("errors", {})[m] = {"at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "message": str(e)}
             if (state / f"{m}.json").exists():  # keep publishing yesterday's file
                 (out / f"{m}.json").write_bytes((state / f"{m}.json").read_bytes())
+    try:
+        update_indices([x.strip().upper() for x in a.markets.split(",") if x.strip()], state, out)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Indices not updated: %s", e)
     # carry over files for markets not processed this run
     for p in state.glob("*.json"):
         if p.name != "meta.json" and not (out / p.name).exists():
