@@ -1,9 +1,16 @@
 name: Nightly market data
 
+# When each market's data is downloaded (GitHub schedules are in UTC and can start a few minutes late):
+#   India          4:39 PM IST (11:09 UTC), with a backup run at 6:39 PM IST (13:09 UTC) in case NSE posts late
+#   USA + Canada   5:00 PM Eastern. Eastern time moves by an hour twice a year, so two schedules are listed
+#                  (21:00 UTC = 5 PM in summer, 22:00 UTC = 5 PM in winter); the "Choose markets" step runs only
+#                  the one that falls at/after 5 PM Eastern and skips a market whose data for today is already in.
 on:
   schedule:
-    - cron: "30 5 * * 2-6"
-    - cron: "0 14 * * 1-5"
+    - cron: "9 11 * * 1-5"    # India, 4:39 PM IST
+    - cron: "9 13 * * 1-5"    # India backup, 6:39 PM IST
+    - cron: "0 21 * * 1-5"    # USA + Canada, 5 PM EDT (summer)
+    - cron: "0 22 * * 1-5"    # USA + Canada, 5 PM EST (winter)
   workflow_dispatch:
     inputs:
       markets:
@@ -38,32 +45,62 @@ jobs:
             echo "No data branch yet - first run will backfill."
           fi
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - run: pip install -r requirements.txt
-
       - name: Choose markets
         id: pick
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "markets=${{ inputs.markets }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "0 14 * * 1-5" ]; then
-            echo "markets=IN" >> "$GITHUB_OUTPUT"
-          else
-            echo "markets=US,CA" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          case "${{ github.event.schedule }}" in
+            "9 11 * * 1-5"|"9 13 * * 1-5") MKTS="IN";    ZONE="Asia/Kolkata";     FROM="1639" ;;
+            *)                             MKTS="US,CA"; ZONE="America/New_York"; FROM="1700" ;;
+          esac
+          NOW=$(TZ="$ZONE" date +%H%M); TODAY=$(TZ="$ZONE" date +%F)
+          echo "Local time in $ZONE: $NOW on $TODAY (update time $FROM)"
+          if [ "$NOW" -lt "$FROM" ]; then
+            echo "Too early for $MKTS (this is the other daylight-saving schedule) - skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # Skip markets that already have today's session (for example the backup run after a successful one)
+          TODO=$(python3 - "$MKTS" "$TODAY" <<'PY'
+          import json, sys
+          mkts, today = sys.argv[1].split(","), sys.argv[2]
+          try:
+              meta = json.load(open("state/meta.json")).get("markets", {})
+          except Exception:
+              meta = {}
+          print(",".join(m for m in mkts if (meta.get(m) or {}).get("asOf") != today))
+          PY
+          )
+          if [ -z "$TODO" ]; then
+            echo "Today's data for $MKTS is already published - nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "Updating: $TODO"
+          echo "markets=$TODO" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        if: steps.pick.outputs.skip != 'true'
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+        if: steps.pick.outputs.skip != 'true'
 
       - name: Fetch and build feed
+        if: steps.pick.outputs.skip != 'true'
         env:
           MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
           EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}   # optional: "Your name your@email" — the SEC asks for a contact
         run: |
           python fetch.py --markets "${{ steps.pick.outputs.markets }}" --state state --out out ${{ inputs.backfill && '--backfill' || '' }}
 
       - name: Publish to the data branch
-        if: always() && hashFiles('out/meta.json') != ''
+        if: always() && steps.pick.outputs.skip != 'true' && hashFiles('out/meta.json') != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
