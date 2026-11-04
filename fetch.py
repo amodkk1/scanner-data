@@ -764,10 +764,10 @@ INDICES = {
     "US": [("^GSPC", "S&P 500"), ("^IXIC", "Nasdaq Composite"), ("^DJI", "Dow Jones Industrial Average")],
     "CA": [("^GSPTSE", "S&P/TSX Composite"), ("^TX60", "S&P/TSX 60")],
     "IN": [("^NSEI", "Nifty 50"), ("^BSESN", "BSE Sensex"), ("^NSEBANK", "Nifty Bank")],
-    # Gold, silver (front-month futures, USD per troy ounce) and Bitcoin (USD). Refreshed with the USA run (5 PM ET).
-    "GL": [("GC=F", "Gold"), ("SI=F", "Silver"), ("BTC-USD", "Bitcoin")],
+    # Gold, silver (front-month futures, USD per troy ounce), Bitcoin and Ethereum (USD). Refreshed with the USA run (5 PM ET).
+    "GL": [("GC=F", "Gold"), ("SI=F", "Silver"), ("BTC-USD", "Bitcoin"), ("ETH-USD", "Ethereum")],
 }
-SEVEN_DAY = {"BTC-USD"}   # trades every day, so it needs more rows to cover the same number of years
+SEVEN_DAY = {"BTC-USD", "ETH-USD"}   # trades every day, so it needs more rows to cover the same number of years
 
 
 def update_indices(markets: list[str], state: Path, out: Path) -> None:
@@ -786,7 +786,7 @@ def update_indices(markets: list[str], state: Path, out: Path) -> None:
         for sym, name in INDICES.get(m, []):
             try:
                 if MOCK:
-                    r = random.Random(sym); px = {"GC=F": 2600, "SI=F": 31, "BTC-USD": 65000}.get(sym) or {"US": 5000, "CA": 25000, "IN": 24000}[m]; rows = []
+                    r = random.Random(sym); px = {"GC=F": 2600, "SI=F": 31, "BTC-USD": 65000, "ETH-USD": 3000}.get(sym) or {"US": 5000, "CA": 25000, "IN": 24000}[m]; rows = []
                     days = [start + dt.timedelta(days=k) for k in range((dt.date.today() - start).days + 1)] if sym in SEVEN_DAY else weekdays_between(start, dt.date.today())
                     for d in days:
                         px *= math.exp(r.gauss(.0004, .01)); hi, lo = px * (1 + abs(r.gauss(0, .005))), px * (1 - abs(r.gauss(0, .005)))
