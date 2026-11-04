@@ -764,7 +764,10 @@ INDICES = {
     "US": [("^GSPC", "S&P 500"), ("^IXIC", "Nasdaq Composite"), ("^DJI", "Dow Jones Industrial Average")],
     "CA": [("^GSPTSE", "S&P/TSX Composite"), ("^TX60", "S&P/TSX 60")],
     "IN": [("^NSEI", "Nifty 50"), ("^BSESN", "BSE Sensex"), ("^NSEBANK", "Nifty Bank")],
+    # Gold, silver (front-month futures, USD per troy ounce) and Bitcoin (USD). Refreshed with the USA run (5 PM ET).
+    "GL": [("GC=F", "Gold"), ("SI=F", "Silver"), ("BTC-USD", "Bitcoin")],
 }
+SEVEN_DAY = {"BTC-USD"}   # trades every day, so it needs more rows to cover the same number of years
 
 
 def update_indices(markets: list[str], state: Path, out: Path) -> None:
@@ -778,12 +781,14 @@ def update_indices(markets: list[str], state: Path, out: Path) -> None:
             old = {}
     idx = dict(old)
     start = dt.date.today() - dt.timedelta(days=int(HISTORY * 1.45) + 10)
-    for m in markets:
+    groups = list(markets) + (["GL"] if "US" in markets else [])
+    for m in groups:
         for sym, name in INDICES.get(m, []):
             try:
                 if MOCK:
-                    r = random.Random(sym); px = {"US": 5000, "CA": 25000, "IN": 24000}[m]; rows = []
-                    for d in weekdays_between(start, dt.date.today()):
+                    r = random.Random(sym); px = {"GC=F": 2600, "SI=F": 31, "BTC-USD": 65000}.get(sym) or {"US": 5000, "CA": 25000, "IN": 24000}[m]; rows = []
+                    days = [start + dt.timedelta(days=k) for k in range((dt.date.today() - start).days + 1)] if sym in SEVEN_DAY else weekdays_between(start, dt.date.today())
+                    for d in days:
                         px *= math.exp(r.gauss(.0004, .01)); hi, lo = px * (1 + abs(r.gauss(0, .005))), px * (1 - abs(r.gauss(0, .005)))
                         rows.append((d.isoformat(), px * (1 + r.gauss(0, .003)), hi, lo, px, 1e9))
                 else:
@@ -795,7 +800,8 @@ def update_indices(markets: list[str], state: Path, out: Path) -> None:
                         df.columns = df.columns.get_level_values(0)
                     rows = [(i.date().isoformat(), r_.get("Open"), r_.get("High"), r_.get("Low"), r_.get("Close"), r_.get("Volume") or 0)
                             for i, r_ in df.dropna(subset=["Close"]).iterrows()]
-                rows = [x for x in rows if all(v is not None and v == v for v in x[1:5])][-HISTORY:]
+                keep = int(HISTORY * 1.45) if sym in SEVEN_DAY else HISTORY
+                rows = [x for x in rows if all(v is not None and v == v for v in x[1:5])][-keep:]
                 if len(rows) < 30:
                     raise RuntimeError(f"only {len(rows)} sessions")
                 idx[sym] = {"s": sym, "n": name, "m": m, "asOf": rows[-1][0], "dates": [x[0] for x in rows],
