@@ -46,6 +46,7 @@ import logging
 import math
 import os
 import random
+import re
 import sys
 import time
 import zipfile
@@ -815,6 +816,187 @@ def update_indices(markets: list[str], state: Path, out: Path) -> None:
     (out / "indices.json").write_text(json.dumps({"v": 1, "generated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "indices": idx}, separators=(",", ":")))
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Big-money moves ("whales"): disclosed large trades by institutions, funds and insiders, from the official regulators.
+#   India  — NSE bulk deals (one client trades ≥ 0.5% of a company's shares in a day) and block deals (single trades of
+#            ₹10 crore+ in the block window). Source: NSE "Bulk & block deals" report (exchange-published, daily).
+#   USA    — SEC EDGAR: Form 4 (company insiders: directors, officers, 10%+ owners; open-market buys and sells) and
+#            Schedule 13D / 13G (anyone crossing 5% ownership; 13D = intends to influence the company, 13G = passive).
+#   Canada — no free machine-readable source (SEDI insider filings have no API), so the app shows a volume footprint instead.
+# The file keeps 120 days and grows run by run, so a missed day is filled in on the next run.
+# ---------------------------------------------------------------------------------------------------------------------
+WHALE_DAYS = 120
+SEC_UA = os.getenv("SEC_USER_AGENT", "").strip() or "StrikeZone market scanner (https://github.com/amodkk1/scanner-data)"
+
+
+def _num(v):
+    try:
+        return float(str(v).replace(",", "").strip())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def india_deals(days: int = 30) -> list[dict]:
+    """NSE bulk + block deals for the last `days` days (falls back to today's archive files if the API refuses)."""
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA, "Accept": "application/json, text/plain, */*", "Accept-Language": "en-US,en;q=0.9",
+                      "Referer": "https://www.nseindia.com/report-detail/display-bulk-and-block-deals"})
+    rows: list[dict] = []
+    try:
+        s.get("https://www.nseindia.com/report-detail/display-bulk-and-block-deals", timeout=20)  # cookie warm-up
+    except Exception:  # noqa: BLE001
+        pass
+    to, frm = dt.date.today(), dt.date.today() - dt.timedelta(days=days)
+    for kind, tag in (("bulk_deals", "bulk"), ("block_deals", "block")):
+        got = False
+        try:
+            r = s.get("https://www.nseindia.com/api/historicalOR/bulk-block-short-deals",
+                      params={"optionType": kind, "from": frm.strftime("%d-%m-%Y"), "to": to.strftime("%d-%m-%Y")}, timeout=30)
+            r.raise_for_status()
+            for d in r.json().get("data", []) or []:
+                try:
+                    day = dt.datetime.strptime(d["BD_DT_DATE"].title(), "%d-%b-%Y").date().isoformat()
+                except Exception:  # noqa: BLE001
+                    continue
+                rows.append({"d": day, "s": (d.get("BD_SYMBOL") or "").strip().upper(), "t": tag, "side": (d.get("BD_BUY_SELL") or "").strip().upper(),
+                             "who": (d.get("BD_CLIENT_NAME") or "").strip(), "qty": _num(d.get("BD_QTY_TRD")), "px": _num(d.get("BD_TP_WATP"))})
+            got = True
+            log.info("[IN] %s: %d rows from the NSE API", tag, sum(1 for x in rows if x["t"] == tag))
+        except Exception as e:  # noqa: BLE001
+            log.warning("[IN] %s API not available (%s) — trying today's archive file", tag, e)
+        if got:
+            continue
+        try:
+            r = http_get(f"https://nsearchives.nseindia.com/content/equities/{tag}.csv", session=s, retries=2, timeout=30)
+            import csv
+            for d in csv.DictReader(io.StringIO(r.text)):
+                k = {re.sub(r"[^a-z]", "", c.lower()): v for c, v in d.items() if c}
+                try:
+                    day = dt.datetime.strptime((k.get("date") or "").strip().title(), "%d-%b-%Y").date().isoformat()
+                except Exception:  # noqa: BLE001
+                    continue
+                px = next((v for c, v in k.items() if c.startswith("tradeprice")), None)
+                rows.append({"d": day, "s": (k.get("symbol") or "").strip().upper(), "t": tag, "side": (k.get("buysell") or "").strip().upper(),
+                             "who": (k.get("clientname") or "").strip(), "qty": _num(k.get("quantitytraded")), "px": _num(px)})
+            log.info("[IN] %s: %d rows from the archive file", tag, sum(1 for x in rows if x["t"] == tag))
+        except Exception as e:  # noqa: BLE001
+            log.warning("[IN] %s archive file not available: %s", tag, e)
+    out = []
+    for x in rows:
+        if not x["s"] or x["side"] not in ("BUY", "SELL") or not x["qty"]:
+            continue
+        x["val"] = rnd(x["qty"] * (x["px"] or 0))
+        x["id"] = f'{x["d"]}|{x["t"]}|{x["s"]}|{x["who"]}|{x["side"]}|{int(x["qty"])}'
+        out.append(x)
+    return out
+
+
+def _sec_get(s: requests.Session, url: str, last: list[float]):
+    wait = 0.12 - (time.time() - last[0])          # SEC fair-access limit: 10 requests per second
+    if wait > 0:
+        time.sleep(wait)
+    last[0] = time.time()
+    return http_get(url, session=s, retries=2, timeout=30)
+
+
+def us_filings(symbols: list[str], seen: set[str], days: int = 30) -> list[dict]:
+    """SEC EDGAR Form 4 (insider buys/sells) and Schedule 13D/13G (5%+ stakes) filed in the last `days` days."""
+    import xml.etree.ElementTree as ET
+    s = requests.Session(); s.headers.update({"User-Agent": SEC_UA, "Accept-Encoding": "gzip, deflate"})
+    last = [0.0]
+    try:
+        cmap = {v["ticker"].upper(): int(v["cik_str"]) for v in _sec_get(s, "https://www.sec.gov/files/company_tickers.json", last).json().values()}
+    except Exception as e:  # noqa: BLE001
+        log.warning("[US] SEC ticker list not available: %s", e); return []
+    since = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+    out, n4 = [], 0
+    for sym in symbols:
+        cik = cmap.get(sym.upper().replace(".", "-")) or cmap.get(sym.upper())
+        if not cik:
+            continue
+        try:
+            rec = _sec_get(s, f"https://data.sec.gov/submissions/CIK{cik:010d}.json", last).json()["filings"]["recent"]
+        except Exception as e:  # noqa: BLE001
+            log.debug("[US] %s submissions: %s", sym, e); continue
+        k4 = 0
+        for form, fdate, acc, doc in zip(rec["form"], rec["filingDate"], rec["accessionNumber"], rec["primaryDocument"]):
+            if fdate < since:
+                break
+            if acc in seen:
+                continue
+            base = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc.replace('-', '')}"
+            f = form.upper()
+            if f in ("4", "4/A"):
+                if k4 >= 12:
+                    continue
+                k4 += 1; n4 += 1
+                try:
+                    root = ET.fromstring(_sec_get(s, f"{base}/{doc.split('/')[-1]}", last).content)
+                except Exception:  # noqa: BLE001
+                    continue
+                g = lambda el, p: (el.findtext(p) or "").strip()  # noqa: E731
+                who = g(root, "reportingOwner/reportingOwnerId/rptOwnerName")
+                rel = root.find("reportingOwner/reportingOwnerRelationship")
+                role = ", ".join(x for x in [g(rel, "officerTitle") if rel is not None and g(rel, "isOfficer") in ("1", "true") else "",
+                                             "Director" if rel is not None and g(rel, "isDirector") in ("1", "true") else "",
+                                             "10% owner" if rel is not None and g(rel, "isTenPercentOwner") in ("1", "true") else ""] if x) or "Insider"
+                plan = g(root, "aff10b5One") in ("1", "true")
+                for side, code in (("BUY", "P"), ("SELL", "S")):
+                    q = v = 0.0
+                    for t in root.findall("nonDerivativeTable/nonDerivativeTransaction"):
+                        if g(t, "transactionCoding/transactionCode") != code:
+                            continue
+                        sh, pr = _num(g(t, "transactionAmounts/transactionShares/value")) or 0, _num(g(t, "transactionAmounts/transactionPricePerShare/value")) or 0
+                        q += sh; v += sh * pr
+                    if q:
+                        out.append({"d": fdate, "s": sym, "t": "insider", "side": side, "who": who, "role": role, "plan": plan, "qty": q,
+                                    "px": rnd(v / q) if q else None, "val": rnd(v), "id": f"{acc}|{side}", "acc": acc, "url": f"{base}/"})
+            elif f.startswith(("SC 13D", "SC 13G", "SCHEDULE 13D", "SCHEDULE 13G")):
+                who, pct = "", None
+                try:
+                    txt = _sec_get(s, f"{base}/{doc.split('/')[-1]}", last).text
+                    m1 = re.search(r"<(?:\w+:)?reportingPersonName>\s*([^<]+)<", txt) or re.search(r"NAMES? OF REPORTING PERSONS?.{0,400}?([A-Z][A-Za-z0-9&.,' -]{3,80})", re.sub(r"<[^>]+>", " ", txt), re.S)
+                    who = (m1.group(1) if m1 else "").strip()[:90]
+                    m2 = re.search(r"<(?:\w+:)?(?:percentOfClass|classPercent)>\s*([\d.]+)", txt) or re.search(r"PERCENT OF CLASS.{0,300}?([\d.]+)\s*%", re.sub(r"<[^>]+>", " ", txt), re.S)
+                    pct = _num(m2.group(1)) if m2 else None
+                except Exception:  # noqa: BLE001
+                    pass
+                out.append({"d": fdate, "s": sym, "t": "13D" if "13D" in f else "13G", "side": "CHG" if "/A" in f else "BUY", "amend": "/A" in f, "who": who, "pct": pct,
+                            "id": acc, "acc": acc, "url": f"{base}/"})
+    log.info("[US] SEC filings: %d new events (%d Form 4 documents read)", len(out), n4)
+    return out
+
+
+def update_whales(markets: list[str], state: Path, out: Path) -> None:
+    """whales.json: recent disclosed big-money trades, merged with the previously published file."""
+    old = {}
+    if (state / "whales.json").exists():
+        try:
+            old = json.loads((state / "whales.json").read_text())
+        except Exception:  # noqa: BLE001
+            old = {}
+    cut = (dt.date.today() - dt.timedelta(days=WHALE_DAYS)).isoformat()
+    res = {"v": 1, "generated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+           "sources": {"IN": "NSE bulk & block deals", "US": "SEC EDGAR Form 4 and Schedule 13D/13G"}, "IN": [], "US": []}
+    for m in ("IN", "US"):
+        prev = [x for x in old.get(m, []) if x.get("d", "") >= cut]
+        new: list[dict] = []
+        if m in markets and not MOCK:
+            try:
+                if m == "IN":
+                    new = india_deals(30)
+                else:
+                    p = out / "US.json" if (out / "US.json").exists() else state / "US.json"
+                    syms = [t["s"] for t in json.loads(p.read_text())["tickers"]] if p.exists() else []
+                    new = us_filings(syms, {x.get("acc") for x in prev if x.get("acc")}, 30)
+            except Exception as e:  # noqa: BLE001 — big-money data must never stop the price data
+                log.warning("[%s] big-money moves not updated: %s", m, e)
+        ids = {x["id"] for x in new}
+        res[m] = sorted([x for x in prev if x.get("id") not in ids] + new, key=lambda x: x["d"], reverse=True)
+        log.info("[%s] big-money moves: %d events kept (%d new this run)", m, len(res[m]), len(new))
+    (out / "whales.json").write_text(json.dumps(res, separators=(",", ":")))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--markets", default="US,CA,IN")
@@ -842,6 +1024,10 @@ def main():
         update_indices([x.strip().upper() for x in a.markets.split(",") if x.strip()], state, out)
     except Exception as e:  # noqa: BLE001
         log.warning("Indices not updated: %s", e)
+    try:
+        update_whales([x.strip().upper() for x in a.markets.split(",") if x.strip()], state, out)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Big-money moves not updated: %s", e)
     # carry over files for markets not processed this run
     for p in state.glob("*.json"):
         if p.name != "meta.json" and not (out / p.name).exists():
