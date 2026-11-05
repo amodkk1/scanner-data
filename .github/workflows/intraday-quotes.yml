@@ -1,0 +1,66 @@
+name: Intraday quotes
+
+# Every 15 minutes while a market is open: today's latest prices (about 15 minutes delayed) → quotes.json on the
+# data branch. GitHub schedules are in UTC and can start late or skip a slot when GitHub is busy.
+#   USA + Canada: 9:30 AM – 4:20 PM Eastern (13:00–21:59 UTC covers summer and winter time; quotes.py checks the clock)
+#   India:        9:15 AM – 3:50 PM IST     (03:00–10:59 UTC)
+on:
+  schedule:
+    - cron: "*/15 13-21 * * 1-5"
+    - cron: "*/15 3-10 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Markets to update even if closed (e.g. US,CA,IN) — for testing"
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: intraday-quotes
+  cancel-in-progress: true
+
+jobs:
+  quotes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load published data
+        run: |
+          mkdir -p state
+          git fetch --depth=1 origin data
+          git --work-tree=state checkout origin/data -- .
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Fetch quotes
+        run: python quotes.py --state state --out qout --force "${{ inputs.force }}"
+
+      - name: Publish quotes.json to the data branch
+        if: hashFiles('qout/quotes.json') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for attempt in 1 2 3; do
+            rm -rf pub
+            git clone -q --depth 1 --branch data "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" pub
+            cp qout/quotes.json pub/quotes.json
+            cd pub
+            git config user.name "scanner-data-bot"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add quotes.json
+            if git diff --cached --quiet; then echo "No change"; exit 0; fi
+            git commit -qm "Quotes $(date -u +%Y-%m-%dT%H:%MZ)"
+            if git push -q origin data; then echo "Published"; exit 0; fi
+            cd ..
+            echo "Push failed (the nightly job may have just published) — retrying"; sleep 15
+          done
+          exit 1
