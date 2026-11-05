@@ -99,6 +99,15 @@ jobs:
         run: |
           python fetch.py --markets "${{ steps.pick.outputs.markets }}" --state state --out out ${{ inputs.backfill && '--backfill' || '' }}
 
+      - name: Record the track record (StrikeZone's BUY signals)
+        if: always() && steps.pick.outputs.skip != 'true' && hashFiles('out/meta.json') != ''
+        continue-on-error: true      # the price data is published even if this step fails
+        timeout-minutes: 40
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+          python track.py --out out --state state --markets "${{ steps.pick.outputs.markets }}"
+
       - name: Publish to the data branch
         if: always() && steps.pick.outputs.skip != 'true' && hashFiles('out/meta.json') != ''
         env:

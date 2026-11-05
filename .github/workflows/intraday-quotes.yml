@@ -1,13 +1,13 @@
 name: Intraday quotes
 
-# Every 15 minutes while a market is open: today's latest prices (about 15 minutes delayed) → quotes.json on the
+# Every 5 minutes (GitHub's fastest schedule) while a market is open: today's latest prices (about 15 minutes delayed) → quotes.json on the
 # data branch. GitHub schedules are in UTC and can start late or skip a slot when GitHub is busy.
 #   USA + Canada: 9:30 AM – 4:20 PM Eastern (13:00–21:59 UTC covers summer and winter time; quotes.py checks the clock)
 #   India:        9:15 AM – 3:50 PM IST     (03:00–10:59 UTC)
 on:
   schedule:
-    - cron: "*/15 13-21 * * 1-5"
-    - cron: "*/15 3-10 * * 1-5"
+    - cron: "*/5 13-21 * * 1-5"
+    - cron: "*/5 3-10 * * 1-5"
   workflow_dispatch:
     inputs:
       force:
