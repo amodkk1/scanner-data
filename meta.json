@@ -1,0 +1,41 @@
+{
+ "markets": {
+  "CA": {
+   "asOf": "2026-11-20",
+   "generated": "2026-11-21T02:08:33+00:00",
+   "tickers": 1501,
+   "sessions": 760,
+   "source": "Yahoo Finance (yfinance) \u00b7 TMX directory, 2492 TSX symbols",
+   "warnings": [],
+   "mine": [
+    "AAPL"
+   ],
+   "notFound": []
+  },
+  "IN": {
+   "asOf": "2026-11-13",
+   "generated": "2026-11-13T18:32:48+00:00",
+   "tickers": 999,
+   "sessions": 757,
+   "source": "NSE bhavcopy (unadjusted for splits)",
+   "warnings": [],
+   "mine": [],
+   "notFound": []
+  },
+  "US": {
+   "asOf": "2026-11-20",
+   "generated": "2026-11-21T02:03:07+00:00",
+   "tickers": 1000,
+   "sessions": 760,
+   "source": "Yahoo Finance (yfinance) \u00b7 S&P 500/400/600, 1502 stocks",
+   "warnings": [
+    "No MASSIVE_API_KEY secret found, so US prices came from Yahoo Finance."
+   ],
+   "mine": [],
+   "notFound": []
+  }
+ },
+ "generated": "2026-11-21T02:08:47+00:00",
+ "v": 1,
+ "errors": {}
+}
